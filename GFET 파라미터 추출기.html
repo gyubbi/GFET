@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GFET Parameter Extracter</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.23.4/full/pyodide.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #f1f5f9; }
+        .loader { border-top-color: #4f46e5; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        const App = () => {
+            const [pyodide, setPyodide] = useState(null);
+            const [isReady, setIsReady] = useState(false);
+            const [processing, setProcessing] = useState(false);
+            const [results, setResults] = useState([]);
+            const [config, setConfig] = useState({ tox: 300, eps: 3.9, vds: 0.5 });
+            const [selectedIdx, setSelectedIdx] = useState(0);
+            const chartRef = useRef(null);
+
+            useEffect(() => {
+                async function init() {
+                    const py = await loadPyodide();
+                    await py.loadPackage(['pandas', 'numpy', 'scipy', 'micropip']);
+                    const micropip = py.pyimport("micropip");
+                    await micropip.install('openpyxl');
+                    setPyodide(py);
+                    setIsReady(true);
+                }
+                init();
+            }, []);
+
+            useEffect(() => {
+                if (results.length > 0 && results[selectedIdx]) {
+                    drawChart(results[selectedIdx]);
+                }
+            }, [results, selectedIdx]);
+
+            const handleFiles = async (e) => {
+                const files = Array.from(e.target.files);
+                if (files.length === 0 || !pyodide) return;
+
+                setProcessing(true);
+                const allResults = [];
+
+                try {
+                    for (const file of files) {
+                        const buffer = await file.arrayBuffer();
+                        pyodide.FS.writeFile(file.name, new Uint8Array(buffer));
+
+                        const pythonCode = `
+import pandas as pd
+import numpy as np
+import re
+import math
+
+def parse_LW(name):
+    m = re.search(r"(\\d+)\\.(\\d+)", name)
+    if not m: return None, None
+    a = int(m.group(1))
+    mapping = {1:(30,200), 2:(50,200), 3:(100,200), 4:(150,200), 5:(100,300), 6:(100,400), 7:(100,600)}
+    return mapping.get(a, (None, None))
+
+def _moving_average(y, win=7):
+    win = max(3, int(win) | 1)
+    k = win // 2
+    pad = np.pad(y, (k, k), mode="edge")
+    ker = np.ones(win, dtype=float) / win
+    return np.convolve(pad, ker, mode="valid")
+
+def _quadratic_vertex(x, y):
+    if len(x) < 3: return None
+    try:
+        coeffs = np.polyfit(x, y, 2)
+        a, b = coeffs[0], coeffs[1]
+        if a <= 0: return None
+        xv = -b / (2*a)
+        if xv < x.min() - 2 or xv > x.max() + 2: return None
+        return float(xv)
+    except:
+        return None
+
+def find_dirac_dual_mode(vg, idc):
+    # 1. Raw Data Point (Actual Minimum in Data)
+    idx_raw = np.argmin(np.abs(idc))
+    v_raw = float(vg[idx_raw])
+    i_raw_min = float(idc[idx_raw])
+    
+    # 2. Smoothing & Fitting Point (Mathematical Peak)
+    order = np.argsort(vg)
+    vs, is_ = vg[order], idc[order]
+    ism = _moving_average(is_, win=7)
+    imin = int(np.argmin(ism))
+    
+    v_smooth = None
+    for w in (11, 9, 7, 5):
+        half = w // 2
+        i0, i1 = max(0, imin-half), min(len(vs)-1, imin+half)
+        xs, ys = vs[i0:i1+1], ism[i0:i1+1]
+        if len(xs) >= 3:
+            v_smooth = _quadratic_vertex(xs, ys)
+            if v_smooth is not None: break
+            
+    if v_smooth is None: v_smooth = float(vs[imin])
+    return v_smooth, float(is_[imin]), v_raw, i_raw_min
+
+def get_slopes_win(x, y, win=11):
+    n = len(x)
+    if n < 5: return np.array([]), np.array([]) 
+    actual_win = min(win, n)
+    if actual_win % 2 == 0: actual_win -= 1
+    k = actual_win // 2
+    slopes, centers = [], []
+    for i in range(k, n-k):
+        xv, yv = x[i-k:i+k+1], y[i-k:i+k+1]
+        vx = np.var(xv)
+        if vx > 0:
+            slopes.append(np.cov(xv, yv)[0, 1] / vx)
+            centers.append(x[i])
+    return np.array(centers), np.array(slopes)
+
+def extract_params(vg, idc, cg, vds_val, l, w):
+    if len(vg) < 5: return None, None, None, None, 0.0, 0.0
+    
+    v_sm, i_sm, v_raw, i_raw = find_dirac_dual_mode(vg, idc)
+    
+    # Mobility calculation margin
+    span = float(vg.max() - vg.min())
+    std_margin = max(0.05 * span, 2.0)
+    mu_e, mu_h = 0.0, 0.0
+    s_idx = np.argsort(vg)
+    vg_s, idc_s = vg[s_idx], idc[s_idx]
+    
+    m_e = vg_s > (v_sm + std_margin)
+    if np.sum(m_e) < 5: m_e = vg_s > (v_sm + 0.5)
+    if np.sum(m_e) >= 3:
+        c, s = get_slopes_win(vg_s[m_e], idc_s[m_e])
+        if len(s) > 0:
+            s_abs = np.abs(s)
+            thr = np.percentile(s_abs, 95.0) if len(s_abs) > 1 else 0
+            eligible = s_abs[s_abs >= thr]
+            gm_peak = np.max(eligible) if len(eligible) > 0 else np.max(s_abs)
+            mu_e = (l/w) * gm_peak / (cg * abs(vds_val))
+            
+    m_h = vg_s < (v_sm - std_margin)
+    if np.sum(m_h) < 5: m_h = vg_s < (v_sm - 0.5)
+    if np.sum(m_h) >= 3:
+        c, s = get_slopes_win(vg_s[m_h], idc_s[m_h])
+        if len(s) > 0:
+            s_abs = np.abs(s)
+            thr = np.percentile(s_abs, 95.0) if len(s_abs) > 1 else 0
+            eligible = s_abs[s_abs >= thr]
+            gm_peak = np.max(eligible) if len(eligible) > 0 else np.max(s_abs)
+            mu_h = (l/w) * gm_peak / (cg * abs(vds_val))
+            
+    return v_sm, i_sm, v_raw, i_raw, mu_e, mu_h
+
+def analyze_file(fname, tox, eps, vds):
+    df = pd.read_excel(fname)
+    vg_col = next(c for c in df.columns if 'gatev' in c.lower() or 'vg' in c.lower())
+    id_col = next(c for c in df.columns if 'sourcei' in c.lower() or 'id' in c.lower())
+    vg_raw = df[vg_col].values
+    id_raw = df[id_col].values
+    
+    l, w = parse_LW(fname)
+    l_w_found = True if (l is not None and w is not None) else False
+    l_val = l if l_w_found else 100.0
+    w_val = w if l_w_found else 200.0
+    cg = eps * 8.854e-14 / (tox * 1e-7)
+    
+    dvg = np.diff(vg_raw)
+    eps_v = max(1e-6, 1e-6 * (np.nanmax(np.abs(vg_raw)) + 1))
+    sign_v = np.sign(np.where(np.abs(dvg) < eps_v, 0.0, dvg))
+    nz = np.where(sign_v != 0)[0]
+    
+    is_dual, turn_idx = False, None
+    if len(nz) > 0:
+        first_dir = sign_v[nz[0]]
+        for k in range(nz[0] + 1, len(sign_v)):
+            if sign_v[k] != 0 and sign_v[k] != first_dir:
+                turn_idx = k
+                is_dual = True
+                break
+
+    if is_dual and turn_idx is not None:
+        vg_f, id_f = vg_raw[:turn_idx+1], id_raw[:turn_idx+1]
+        vg_b, id_b = vg_raw[turn_idx:], id_raw[turn_idx:]
+        v_sm_f, i_sm_f, v_rw_f, i_rw_f, me_f, mh_f = extract_params(vg_f, id_f, cg, vds, l_val, w_val)
+        v_sm_b, i_sm_b, v_rw_b, i_rw_b, me_b, mh_b = extract_params(vg_b, id_b, cg, vds, l_val, w_val)
+        
+        shift_sm = v_sm_b - v_sm_f if v_sm_f is not None and v_sm_b is not None else 0.0
+        shift_rw = v_rw_b - v_rw_f if v_rw_f is not None and v_rw_b is not None else 0.0
+        
+        return {
+            "name": fname, "type": "Dual", "l": l, "w": w, "l_w_found": l_w_found,
+            "fwd": {"v_sm": round(v_sm_f, 3), "i_sm": format(i_sm_f, ".2e"), "v_rw": round(v_rw_f, 3), "i_rw": format(i_rw_f, ".2e"), "mu_e": round(me_f, 2), "mu_h": round(mh_f, 2)},
+            "bwd": {"v_sm": round(v_sm_b, 3), "i_sm": format(i_sm_b, ".2e"), "v_rw": round(v_rw_b, 3), "i_rw": format(i_rw_b, ".2e"), "mu_e": round(me_b, 2), "mu_h": round(mh_b, 2)},
+            "shift_sm": round(shift_sm, 3), "shift_rw": round(shift_rw, 3),
+            "raw": {
+                "f": [{"x": float(vx), "y": float(vi)} for vx, vi in zip(vg_f, id_f)],
+                "b": [{"x": float(vx), "y": float(vi)} for vx, vi in zip(vg_b, id_b)]
+            }
+        }
+    else:
+        v_sm, i_sm, v_rw, i_rw, me, mh = extract_params(vg_raw, id_raw, cg, vds, l_val, w_val)
+        return {
+            "name": fname, "type": "Single", "l": l, "w": w, "l_w_found": l_w_found,
+            "fwd": {"v_sm": round(v_sm, 3), "i_sm": format(i_sm, ".2e"), "v_rw": round(v_rw, 3), "i_rw": format(i_rw, ".2e"), "mu_e": round(me, 2), "mu_h": round(mh, 2)},
+            "bwd": None, "shift_sm": 0.0, "shift_rw": 0.0,
+            "raw": { "f": [{"x": float(vx), "y": float(vi)} for vx, vi in zip(vg_raw, id_raw)], "b": None }
+        }
+
+analyze_file("${file.name}", ${config.tox}, ${config.eps}, ${config.vds})
+`;
+                        const res = await pyodide.runPythonAsync(pythonCode);
+                        allResults.push(res.toJs({dict_converter: Object.fromEntries}));
+                    }
+                    setResults(allResults);
+                    setSelectedIdx(0);
+                } catch (err) {
+                    console.error(err);
+                    alert("분석 오류: 데이터 처리 중 문제가 발생했습니다.");
+                } finally {
+                    setProcessing(false);
+                }
+            };
+
+            const downloadExcel = async () => {
+                if (results.length === 0 || !pyodide) return;
+                const summary = results.map(r => ({
+                    "File": r.name, "Type": r.type, "L(um)": r.l || "-", "W(um)": r.w || "-",
+                    "Dirac_Smooth_Fwd(V)": r.fwd.v_sm, "Dirac_Raw_Fwd(V)": r.fwd.v_rw,
+                    "Dirac_Smooth_Bwd(V)": r.bwd ? r.bwd.v_sm : "-", "Dirac_Raw_Bwd(V)": r.bwd ? r.bwd.v_rw : "-",
+                    "Shift_Smooth(V)": r.shift_sm, "Shift_Raw(V)": r.shift_rw,
+                    "Imin_Smooth_Fwd(A)": r.fwd.i_sm, "Imin_Raw_Fwd(A)": r.fwd.i_rw,
+                    "muE_Fwd": r.fwd.mu_e, "muH_Fwd": r.fwd.mu_h,
+                    "muE_Bwd": r.bwd ? r.bwd.mu_e : "-", "muH_Bwd": r.bwd ? r.bwd.mu_h : "-"
+                }));
+                pyodide.globals.set("summary_list", pyodide.toPy(summary));
+                await pyodide.runPythonAsync(`import pandas as pd; pd.DataFrame(summary_list).to_excel("Summary.xlsx", index=False)`);
+                const fileData = pyodide.FS.readFile("Summary.xlsx");
+                const a = document.createElement("a");
+                a.href = URL.createObjectURL(new Blob([fileData], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+                a.download = "GFET_Parameter_Summary.xlsx"; a.click();
+            };
+
+            const drawChart = (data) => {
+                const ctx = document.getElementById('mainChart');
+                if (!ctx) return;
+                if (chartRef.current) chartRef.current.destroy();
+
+                const datasets = [{
+                    label: 'Forward Sweep',
+                    data: data.raw.f,
+                    borderColor: '#4f46e5',
+                    backgroundColor: 'rgba(79, 70, 229, 0.1)',
+                    borderWidth: 2, pointRadius: 1, showLine: true
+                }];
+
+                if (data.raw.b) {
+                    datasets.push({
+                        label: 'Backward Sweep',
+                        data: data.raw.b,
+                        borderColor: '#f43f5e',
+                        backgroundColor: 'rgba(244, 63, 94, 0.1)',
+                        borderWidth: 2, pointRadius: 1, showLine: true
+                    });
+                }
+
+                chartRef.current = new Chart(ctx, {
+                    type: 'scatter',
+                    data: { datasets },
+                    options: {
+                        responsive: true, maintainAspectRatio: false,
+                        scales: {
+                            x: { type: 'linear', title: { display: true, text: 'Gate Voltage (V)' } },
+                            y: { title: { display: true, text: 'Drain Current (A)' } }
+                        }
+                    }
+                });
+            };
+
+            const current = results[selectedIdx];
+
+            return (
+                <div className="min-h-screen p-4 md:p-8 max-w-7xl mx-auto">
+                    <header className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4 bg-white p-8 rounded-[2rem] shadow-sm border border-slate-200">
+                        <div>
+                            <h1 className="text-3xl font-black text-slate-900 tracking-tight flex items-center gap-3">
+                                <span className="p-3 bg-indigo-600 rounded-2xl text-white shadow-lg shadow-indigo-200">
+                                    <svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                                </span>
+                                GFET Parameter Extracter
+                            </h1>
+                            <p className="text-slate-400 text-[10px] mt-2 uppercase font-black tracking-[0.2em]">V9 | Dual-Mode Extraction</p>
+                        </div>
+                        <div className="flex items-center gap-4">
+                            <div className={`px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-widest ${isReady ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>
+                                {isReady ? 'Engine Online' : 'Waking Python...'}
+                            </div>
+                            {results.length > 0 && (
+                                <button onClick={downloadExcel} className="bg-slate-900 text-white px-8 py-3 rounded-2xl text-sm font-bold hover:bg-slate-800 transition-all shadow-xl shadow-slate-200 flex items-center gap-2">
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a2 2 0 002 2h12a2 2 0 002-2v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                                    Get Batch Report
+                                </button>
+                            )}
+                        </div>
+                    </header>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                        <div className="lg:col-span-4 space-y-6">
+                            <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200">
+                                <h2 className="text-[10px] font-black text-slate-400 uppercase mb-5 tracking-[0.2em] text-center">Constants & Formula</h2>
+                                <div className="grid grid-cols-3 gap-3 mb-4">
+                                    <InputBox label="tox (nm)" value={config.tox} onChange={v => setConfig({...config, tox: v})} />
+                                    <InputBox label="eps_r" value={config.eps} onChange={v => setConfig({...config, eps: v})} />
+                                    <InputBox label="Vds (V)" value={config.vds} onChange={v => setConfig({...config, vds: v})} />
+                                </div>
+                                <div className="p-3 bg-slate-50 border border-slate-100 rounded-xl text-[9px] text-slate-500 leading-relaxed">
+                                    <div className="font-bold mb-1 text-slate-700 uppercase tracking-tighter">Calculation Reference:</div>
+                                    μ = (L/W) · (g<sub>m</sub> / (C<sub>g</sub> · |V<sub>ds</sub>|))<br/>
+                                    C<sub>g</sub> = (ε<sub>0</sub> · ε<sub>r</sub>) / t<sub>ox</sub>
+                                </div>
+                            </div>
+
+                            <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200">
+                                <h2 className="text-[10px] font-black text-slate-400 uppercase mb-5 tracking-[0.2em] text-center">Data Import</h2>
+                                <label className={`w-full h-24 border-2 border-dashed rounded-3xl flex flex-col items-center justify-center cursor-pointer transition-all ${processing ? 'border-indigo-200 bg-indigo-50' : 'border-slate-200 hover:border-indigo-500 hover:bg-indigo-50'}`}>
+                                    <input type="file" multiple className="hidden" accept=".xlsx" onChange={handleFiles} disabled={!isReady || processing} />
+                                    {processing ? <div className="w-6 h-6 border-4 border-slate-100 border-t-indigo-600 rounded-full loader"></div> : <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">+ Add Files</span>}
+                                </label>
+
+                                <div className="mt-6 max-h-[300px] overflow-y-auto custom-scrollbar space-y-2">
+                                    {results.map((r, i) => (
+                                        <div key={i} onClick={() => setSelectedIdx(i)} className={`p-4 rounded-2xl cursor-pointer transition-all border ${selectedIdx === i ? 'bg-indigo-600 text-white border-indigo-600 shadow-xl shadow-indigo-100' : 'bg-slate-50 border-slate-100 hover:bg-slate-100 text-slate-600'}`}>
+                                            <p className="text-xs font-bold truncate">{r.name}</p>
+                                            <div className="flex justify-between text-[8px] opacity-60 mt-1 font-black uppercase">
+                                                <span>{r.type}</span>
+                                                {r.shift_sm !== 0 && <span>ΔV: {r.shift_sm}V</span>}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="lg:col-span-8">
+                            {current ? (
+                                <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-700">
+                                    <div className="flex items-center justify-between px-6 py-3 bg-white border border-slate-100 rounded-2xl shadow-sm">
+                                        <div className="flex items-center gap-4">
+                                            <div className="flex flex-col">
+                                                <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Detected Channel L</span>
+                                                <span className={`text-xs font-bold ${current.l_w_found ? 'text-indigo-600' : 'text-rose-500'}`}>
+                                                    {current.l_w_found ? `${current.l} μm` : 'Not Found (Using 100)'}
+                                                </span>
+                                            </div>
+                                            <div className="w-[1px] h-6 bg-slate-100"></div>
+                                            <div className="flex flex-col">
+                                                <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Detected Channel W</span>
+                                                <span className={`text-xs font-bold ${current.l_w_found ? 'text-indigo-600' : 'text-rose-500'}`}>
+                                                    {current.l_w_found ? `${current.w} μm` : 'Not Found (Using 200)'}
+                                                </span>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <ResultPanel title="Forward" color="indigo" data={current.fwd} />
+                                        <ResultPanel title="Backward" color="rose" data={current.bwd} isDual={current.type === "Dual"} />
+                                    </div>
+
+                                    {current.type === "Dual" && (
+                                        <div className="bg-slate-900 p-6 rounded-[2rem] shadow-2xl space-y-4">
+                                            <div className="flex justify-between items-center border-b border-slate-800 pb-4">
+                                                <div className="flex flex-col">
+                                                    <span className="text-[10px] font-black uppercase tracking-[0.2em] text-indigo-400">Smoothing Shift</span>
+                                                    <span className="text-[8px] text-slate-500 uppercase font-bold text-slate-500">Vdirac_bwd - Vdirac_fwd (Fitted)</span>
+                                                </div>
+                                                <span className="text-3xl font-black text-white tracking-tighter">{current.shift_sm} V</span>
+                                            </div>
+                                            <div className="flex justify-between items-center">
+                                                <div className="flex flex-col">
+                                                    <span className="text-[10px] font-black uppercase tracking-[0.2em] text-rose-400">Raw Data Shift</span>
+                                                    <span className="text-[8px] text-slate-500 uppercase font-bold text-slate-500">Vdirac_bwd - Vdirac_fwd (Actual)</span>
+                                                </div>
+                                                <span className="text-3xl font-black text-slate-400 tracking-tighter">{current.shift_rw} V</span>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    <div className="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-200">
+                                        <div className="h-[450px] w-full">
+                                            <canvas id="mainChart"></canvas>
+                                        </div>
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="h-full bg-white rounded-[3rem] border border-slate-200 flex flex-col items-center justify-center p-12 text-center shadow-inner">
+                                    <div className="w-24 h-24 bg-slate-50 rounded-full flex items-center justify-center mb-6 shadow-sm">
+                                        <svg className="w-10 h-10 text-slate-200" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+                                    </div>
+                                    <h3 className="font-black text-slate-300 uppercase tracking-[0.3em]">Waiting for data</h3>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const InputBox = ({ label, value, onChange }) => (
+            <div className="flex flex-col gap-1 text-center">
+                <label className="text-[8px] font-black text-slate-400 uppercase">{label}</label>
+                <input type="number" value={value} onChange={e => onChange(e.target.value)} className="w-full p-3 bg-slate-50 border border-slate-100 rounded-2xl text-[10px] font-black outline-none focus:ring-2 focus:ring-indigo-500 transition-all" />
+            </div>
+        );
+
+        const ResultPanel = ({ title, color, data, isDual = true }) => (
+            <div className={`p-6 rounded-[2rem] border transition-all ${isDual ? `bg-${color}-50/50 border-${color}-100 shadow-sm` : 'bg-slate-50 border-slate-100 opacity-30 grayscale'}`}>
+                <h3 className={`text-[10px] font-black uppercase tracking-widest flex items-center gap-2 mb-4 ${isDual ? `text-${color}-600` : 'text-slate-400'}`}>
+                    <div className={`w-2 h-2 rounded-full ${isDual ? `bg-${color}-600` : 'bg-slate-300'}`}></div> {title} Sweep
+                </h3>
+                {isDual && data ? (
+                    <div className="space-y-4">
+                        <div className="grid grid-cols-2 gap-3">
+                            <StatBox label="Dirac (Smooth)" value={data.v_sm} unit="V" highlight={true} />
+                            <StatBox label="Dirac (Raw)" value={data.v_rw} unit="V" />
+                            <StatBox label="Elect. μ" value={data.mu_e} unit="cm²/Vs" />
+                            <StatBox label="Hole μ" value={data.mu_h} unit="cm²/Vs" />
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                            <StatBox label="Imin (Smooth)" value={data.i_sm} unit="A" />
+                            <StatBox label="Imin (Raw)" value={data.i_rw} unit="A" />
+                        </div>
+                    </div>
+                ) : (
+                    <div className="h-28 flex items-center justify-center text-[10px] font-black text-slate-300 tracking-widest italic uppercase">Inactive</div>
+                )}
+            </div>
+        );
+
+        const StatBox = ({ label, value, unit, highlight = false }) => (
+            <div className={`p-4 rounded-2xl shadow-sm border transition-all ${highlight ? 'bg-indigo-600 border-indigo-700 text-white' : 'bg-white border-slate-100'}`}>
+                <p className={`text-[7px] font-black uppercase tracking-tighter mb-1 ${highlight ? 'text-indigo-200' : 'text-slate-400'}`}>{label}</p>
+                <div className="flex items-baseline gap-1">
+                    <span className="text-sm font-black tracking-tighter">{value}</span>
+                    <span className={`text-[8px] font-black uppercase ml-0.5 ${highlight ? 'text-indigo-300' : 'text-slate-300'}`}>{unit}</span>
+                </div>
+            </div>
+        );
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
